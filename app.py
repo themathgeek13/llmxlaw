@@ -1,7 +1,7 @@
 from flask import Flask, render_template, request, jsonify
 from dotenv import load_dotenv
 import os
-import google.generativeai as genai
+from google import genai
 from jusmundi_api import JusMundiAPI
 from knowledge_graph import KnowledgeGraph
 from rag_system import RAGSystem
@@ -12,7 +12,7 @@ import networkx as nx
 load_dotenv()
 
 # Initialize Gemini
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+genai_client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
 
 app = Flask(__name__)
 

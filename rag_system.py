@@ -1,19 +1,17 @@
-import google.generativeai as genai
-from google.generativeai.types import Tool, GenerateContentConfig, GoogleSearch
+from google import genai
 from typing import List, Dict, Any
 import json
+import os
 
 class RAGSystem:
     def __init__(self, knowledge_graph):
         self.knowledge_graph = knowledge_graph
         self.model = "gemini-2.0-flash"
-        self.google_search_tool = Tool(
-            google_search=GoogleSearch()
-        )
+        self.client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
 
     def get_response(self, query: str, cases: List[Dict[str, Any]]) -> str:
         """
-        Get a context-aware response using Gemini with Google Search grounding
+        Get a context-aware response using Gemini
         """
         # Prepare context from cases
         context = self._prepare_context(cases)
@@ -35,18 +33,14 @@ class RAGSystem:
         """
         
         try:
-            # Get response with Google Search grounding
-            response = genai.generate_content(
+            # Get response from Gemini
+            response = self.client.models.generate_content(
                 model=self.model,
-                contents=prompt,
-                config=GenerateContentConfig(
-                    tools=[self.google_search_tool],
-                    response_modalities=["TEXT"],
-                )
+                contents=prompt
             )
             
             # Extract entities and relations from the response
-            self._extract_and_update_graph(response)
+            self._extract_and_update_graph(response.text)
             
             return response.text
         except Exception as e:
@@ -80,35 +74,38 @@ class RAGSystem:
         
         return "\n".join(context_parts)
 
-    def _extract_and_update_graph(self, response):
+    def _extract_and_update_graph(self, response_text):
         """
         Extract entities and relations from the response and update the knowledge graph
         """
         try:
             # Extract entities and relations using Gemini
-            extraction_prompt = """
+            extraction_prompt = f"""
             Extract the following from the text:
             1. Arbitrators and their roles
             2. Cases and their outcomes
             3. Challenge grounds and their frequency
             4. Relationships between entities
             
+            Text to analyze:
+            {response_text}
+            
             Return the result in JSON format with the following structure:
-            {
-                "entities": {
-                    "arbitrators": [{"name": "...", "role": "..."}],
-                    "cases": [{"title": "...", "outcome": "..."}],
-                    "challenges": [{"grounds": "...", "frequency": "..."}]
-                },
+            {{
+                "entities": {{
+                    "arbitrators": [{{"name": "...", "role": "..."}}],
+                    "cases": [{{"title": "...", "outcome": "..."}}],
+                    "challenges": [{{"grounds": "...", "frequency": "..."}}]
+                }},
                 "relations": [
-                    {"from": "...", "to": "...", "type": "..."}
+                    {{"from": "...", "to": "...", "type": "..."}}
                 ]
-            }
+            }}
             """
             
-            extraction_response = genai.generate_content(
+            extraction_response = self.client.models.generate_content(
                 model=self.model,
-                contents=extraction_prompt + response.text
+                contents=extraction_prompt
             )
             
             # Parse the extraction result
