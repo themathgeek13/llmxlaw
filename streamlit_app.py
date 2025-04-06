@@ -25,6 +25,8 @@ from queue import Queue
 from threading import Lock
 import threading
 import re
+import math
+from groq import Groq
 
 from jusmundi_api import JusMundiAPI
 from knowledge_graph import KnowledgeGraph
@@ -39,6 +41,9 @@ load_dotenv()
 
 # Initialize Gemini
 client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+
+# Initialize Groq
+groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
 
 # Initialize thread-safe data structures
 class ThreadSafeCounter:
@@ -148,22 +153,19 @@ def generate_network_graph(graph_data):
         'date': '#607D8B',        # Blue Grey
         'document': '#795548',    # Brown
         'organization': '#00BCD4', # Cyan
-        'place': '#FFEB3B'        # Yellow
+        'place': '#FFEB3B',       # Yellow
+        'conflict': '#F44336'     # Red (for conflict nodes)
     }
     
-    # Get counts of each node type for sizing
-    node_type_counts = {}
-    for node in graph_data.nodes(data=True):
-        node_type = node[1].get('type', 'unknown')
-        node_type_counts[node_type] = node_type_counts.get(node_type, 0) + 1
+    # Calculate degree (number of connections) for each node
+    node_degrees = dict(graph_data.degree())
     
-    # Scale node size based on node type frequency (rarer types are larger)
-    def get_node_size(node_type):
-        count = node_type_counts.get(node_type, 1)
-        total_nodes = len(graph_data.nodes)
-        # Base size on inverse frequency (rarer = bigger)
-        size_multiplier = 25 * (1 - (count / total_nodes))
-        return max(15, min(50, 20 + size_multiplier))  # Between 15 and 50
+    # Function to calculate node size based on degree
+    def get_node_size(node_id):
+        degree = node_degrees.get(node_id, 1)
+        # Base size on degree with a logarithmic scale to prevent huge nodes
+        size_multiplier = 5 * (1 + math.log(degree + 1, 2))
+        return max(15, min(60, 15 + size_multiplier))  # Between 15 and 60
     
     # Add nodes
     for node in graph_data.nodes(data=True):
@@ -225,6 +227,12 @@ Source: {node_data.get('source', '')}"""
             title = f"""Amount: {node_data.get('amount', '')} {node_data.get('currency', '')}
 Type: {node_data.get('type', '')}
 Description: {node_data.get('description', '')}"""
+        elif node_type == 'conflict':
+            label = node_data.get('name', 'Conflict')
+            category = node_data.get('category', '')
+            title = f"""Conflict: {label}
+Category: {category}
+Details: {node_data.get('details', '')}"""
         else:
             label = node_data.get('name', str(node_id))[:15] + '...' if len(node_data.get('name', str(node_id))) > 15 else node_data.get('name', str(node_id))
             title = f"{node_type.capitalize()}: {node_data.get('name', '')}"
@@ -235,7 +243,7 @@ Description: {node_data.get('description', '')}"""
         
         # Get appropriate color and size
         color = colors.get(node_type, '#666666')
-        size = get_node_size(node_type)
+        size = get_node_size(node_id)
         
         net.add_node(
             node_id,
@@ -261,7 +269,7 @@ Description: {node_data.get('description', '')}"""
         # Set edge color and arrow properties based on relationship type
         if 'appointed' in rel_type:
             edge_color = 'blue'
-        elif 'challenge' in rel_type:
+        elif 'challenge' in rel_type or 'conflict' in rel_type:
             edge_color = 'red'
         elif 'filed' in rel_type:
             edge_color = 'orange'
@@ -432,7 +440,7 @@ def fetch_decision_details(case_id, decision):
     return None
 
 def extract_entities_relations(text, client):
-    """Extract detailed entities and relations using Gemini API with a two-step approach"""
+    """Extract detailed entities and relations using Groq LLM with a two-step approach"""
     
     # Gather all available case information into a single text
     case_attrs = text.get('attributes', {})
@@ -456,72 +464,12 @@ def extract_entities_relations(text, client):
     {text.get('individuals_text', '')}
     """
 
-    # STEP 1: First search with Google grounding to get detailed information
+    # STEP 1: First extract detailed information using Groq
     try:
         logger.info(f"Starting entity extraction for case: {case_attrs.get('title', 'Unknown')}")
         
-        # Configure the search tool for grounding
-        google_search_tool = genai.types.Tool(
-            google_search=genai.types.GoogleSearch()
-        )
-
         # First prompt - to gather deep context about the case
-        search_prompt = f"""
-        I need extremely detailed information about this arbitration case:
-        {case_attrs.get('title', '')} 
-        
-        Find ALL specific details about:
-        1. Every party involved (companies, governments, individuals, subsidiaries)
-        2. Every arbitrator and counsel member, including their nationalities and firms
-        3. All challenges, including precise grounds, outcomes, and dates
-        4. All key dates and events in chronological order (filings, hearings, decisions)
-        5. All monetary claims and awards with exact amounts
-        6. All cited legal provisions, treaties, and rules
-        7. All relationships between entities (ownership, representation, appointment)
-        8. All jurisdictions, locations, and countries mentioned
-        
-        Provide the most granular and specific details possible about this case.
-        
-        Context: {case_text}
-        """
-        
-        # Make first API call with Google Search grounding
-        logger.info("Making first API call to search for case details...")
-        try:
-            search_response = client.models.generate_content(
-                model="gemini-2.0-flash",  # Switch back to flash model
-                contents=search_prompt,
-                config=genai.types.GenerateContentConfig(
-                    tools=[google_search_tool],
-                    response_modalities=["TEXT"],
-                    temperature=0.1,
-                )
-            )
-            
-            if not search_response.candidates:
-                logger.error("Empty response from Gemini search API")
-                return {"entities": [], "relations": [], "events": [], "challenges": []}
-                
-            # Get the enhanced context from search
-            enhanced_context = search_response.candidates[0].content.parts[0].text
-            
-            logger.info(f"Enhanced context obtained: {enhanced_context[:200]}...")
-        except Exception as e:
-            logger.error(f"Error in first API call: {str(e)}")
-            # Continue with just the original case text
-            enhanced_context = "No additional details found."
-        
-        # Combine original case details with enhanced context
-        combined_context = f"""
-        ORIGINAL CASE DETAILS:
-        {case_text}
-        
-        ENHANCED DETAILS:
-        {enhanced_context}
-        """
-        
-        # STEP 2: Use the combined context to extract structured entities and relations
-        extraction_prompt = """
+        extraction_prompt = f"""
         Extract EVERY POSSIBLE entity and relationship from this arbitration case information. 
         
         Be EXTREMELY detailed and granular. The goal is to create a comprehensive network graph, so extract as many entities, relationships, and attributes as possible.
@@ -583,31 +531,31 @@ def extract_entities_relations(text, client):
         
         If you're not sure about an entity or relationship, create a reasonable estimate based on the available information.
         At minimum, include the case itself, all named parties, arbitrators, and decisions as entities.
+        
+        Case details:
+        {case_text}
         """
         
-        # Make second API call with the enhanced context
-        logger.info("Making second API call to extract structured entities...")
+        # Make API call with Groq
+        logger.info("Making API call to extract structured entities...")
         try:
-            extraction_response = client.models.generate_content(
-                model="gemini-2.0-flash", # Use flash model for consistent results
-                contents=[
-                    extraction_prompt,
-                    combined_context
+            completion = groq_client.chat.completions.create(
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                messages=[
+                    {"role": "system", "content": "You are an expert in international arbitration who extracts entities and relationships from case information with extreme precision. You always respond in valid JSON format."},
+                    {"role": "user", "content": extraction_prompt}
                 ],
-                config=genai.types.GenerateContentConfig(
-                    temperature=0.1,  # Lower temperature for more consistent output
-                    max_output_tokens=8192, # Increase token limit for more detailed output
-                    top_p=0.95,
-                    top_k=40
-                )
+                temperature=0.1,  # Lower temperature for more consistent output
+                max_tokens=8192,  # Increase token limit for more detailed output
+                top_p=0.95,
             )
             
-            if not extraction_response.text:
-                logger.error("Empty response from Gemini extraction API")
+            if not completion.choices or not completion.choices[0].message.content:
+                logger.error("Empty response from Groq API")
                 # Return minimal structure to avoid breaking code
                 return create_fallback_analysis(text)
                 
-            response_text = extraction_response.text.strip()
+            response_text = completion.choices[0].message.content.strip()
             logger.info(f"Received extraction response of length: {len(response_text)}")
             
             # Clean up the response text to ensure it's valid JSON
@@ -751,11 +699,11 @@ def extract_entities_relations(text, client):
                 return create_fallback_analysis(text)
                 
         except Exception as e:
-            logger.error(f"Error in second API call: {str(e)}")
+            logger.error(f"Error in API call: {str(e)}")
             return create_fallback_analysis(text)
 
     except Exception as e:
-        logger.error(f"Error in two-step entity extraction: {str(e)}")
+        logger.error(f"Error in entity extraction: {str(e)}")
         return create_fallback_analysis(text)
 
 def create_fallback_analysis(text):
@@ -1213,120 +1161,208 @@ def process_case(case, status_placeholder=None):
             'error': str(e)
         }
 
-def analyze_conflicts_iba(cases, party_info, decision_info):
-    """Analyze conflicts based on IBA Guidelines traffic light system"""
+def analyze_conflicts_with_kg(knowledge_graph):
+    """
+    Analyze conflicts using the knowledge graph data for more comprehensive analysis
+    based on IBA Guidelines traffic light system
+    """
     conflicts = {
-        'red': [],  # Non-waivable conflicts
+        'red': [],    # Non-waivable conflicts
         'orange': [], # Waivable conflicts if parties agree
-        'green': []  # Minor issues to disclose
+        'green': []   # Minor issues to disclose
     }
     
-    # Build relationship maps
-    arbitrators = {}  # arbitrator -> cases/roles
-    law_firms = {}   # firm -> cases/roles
-    parties = {}     # party -> cases/roles
+    # Extract entities by type for easier analysis
+    arbitrators = {}  # id -> data
+    parties = {}      # id -> data
+    law_firms = {}    # id -> data
+    cases = {}        # id -> data
+    challenges = {}   # id -> data
     
-    for case in cases:
-        case_id = case.get('id')
-        if not case_id:
-            continue
-            
-        # Get all decisions for this case
-        case_decisions = [
-            decision for key, decision in decision_info.items()
-            if key.startswith(f"{case_id}_")
-        ]
+    # Collect entities by type
+    for node, data in knowledge_graph.nodes(data=True):
+        node_type = data.get('type', 'unknown')
         
-        # Get all parties for this case
-        case_parties = [
-            party for key, party in party_info.items()
-            if key.startswith(f"{case_id}_")
-        ]
-        
-        # Process arbitrators from decisions
-        for decision in case_decisions:
-            individuals = decision.get('individuals', [])
-            for individual in individuals:
-                attrs = individual.get('attributes', {})
-                name = attrs.get('name')
-                role = attrs.get('role', '').lower()
-                firm = attrs.get('firm')
-                
-                if 'arbitrator' in role or 'president' in role or 'chairman' in role:
-                    if name not in arbitrators:
-                        arbitrators[name] = {'cases': set(), 'roles': set(), 'firms': set()}
-                    arbitrators[name]['cases'].add(case_id)
-                    arbitrators[name]['roles'].add(role)
-                    if firm:
-                        arbitrators[name]['firms'].add(firm)
-                        if firm not in law_firms:
-                            law_firms[firm] = {'cases': set(), 'roles': set()}
-                        law_firms[firm]['cases'].add(case_id)
-                        law_firms[firm]['roles'].add('arbitrator firm')
-        
-        # Process parties
-        for party in case_parties:
-            attrs = party.get('attributes', {})
-            name = attrs.get('name')
-            role = attrs.get('role')
-            if name:
-                if name not in parties:
-                    parties[name] = {'cases': set(), 'roles': set()}
-                parties[name]['cases'].add(case_id)
-                parties[name]['roles'].add(role)
+        if node_type == 'arbitrator' or 'arbitrator' in node_type:
+            arbitrators[node] = data
+        elif node_type == 'party' or node_type == 'company' or node_type == 'government':
+            parties[node] = data
+        elif node_type == 'law_firm' or node_type == 'firm':
+            law_firms[node] = data
+        elif node_type == 'case':
+            cases[node] = data
+        elif node_type == 'challenge':
+            challenges[node] = data
     
-    # Analyze conflicts based on IBA Guidelines
+    # Map relationships
+    arbitrator_cases = {}      # arbitrator -> set of cases
+    arbitrator_firms = {}      # arbitrator -> set of firms
+    arbitrator_challenges = {} # arbitrator -> set of challenges
+    party_cases = {}           # party -> set of cases
+    firm_cases = {}            # firm -> set of cases
     
-    # Red List (Non-waivable)
-    for arb_name, arb_data in arbitrators.items():
-        # Check identity with party
-        if arb_name in parties:
-            conflicts['red'].append({
-                'type': 'identity_with_party',
-                'arbitrator': arb_name,
-                'details': f"Arbitrator is also a party in related cases"
-            })
+    # Process all relationships
+    for source, target, data in knowledge_graph.edges(data=True):
+        rel_type = data.get('type', 'unknown')
         
-        # Check repeat appointments
-        if len(arb_data['cases']) > 3:
+        # Arbitrator to case relationships
+        if source in arbitrators and target in cases:
+            if source not in arbitrator_cases:
+                arbitrator_cases[source] = set()
+            arbitrator_cases[source].add(target)
+        elif source in cases and target in arbitrators:
+            if target not in arbitrator_cases:
+                arbitrator_cases[target] = set()
+            arbitrator_cases[target].add(source)
+        
+        # Arbitrator to firm relationships
+        if source in arbitrators and target in law_firms:
+            if source not in arbitrator_firms:
+                arbitrator_firms[source] = set()
+            arbitrator_firms[source].add(target)
+        elif source in law_firms and target in arbitrators:
+            if target not in arbitrator_firms:
+                arbitrator_firms[target] = set()
+            arbitrator_firms[target].add(source)
+        
+        # Party to case relationships
+        if source in parties and target in cases:
+            if source not in party_cases:
+                party_cases[source] = set()
+            party_cases[source].add(target)
+        elif source in cases and target in parties:
+            if target not in party_cases:
+                party_cases[target] = set()
+            party_cases[target].add(source)
+        
+        # Firm to case relationships
+        if source in law_firms and target in cases:
+            if source not in firm_cases:
+                firm_cases[source] = set()
+            firm_cases[source].add(target)
+        elif source in cases and target in law_firms:
+            if target not in firm_cases:
+                firm_cases[target] = set()
+            firm_cases[target].add(source)
+        
+        # Challenge relationships
+        if source in challenges and target in arbitrators:
+            if target not in arbitrator_challenges:
+                arbitrator_challenges[target] = set()
+            arbitrator_challenges[target].add(source)
+        elif source in arbitrators and target in challenges:
+            if source not in arbitrator_challenges:
+                arbitrator_challenges[source] = set()
+            arbitrator_challenges[source].add(target)
+    
+    # Analysis based on IBA Guidelines
+    
+    # 1. RED LIST (Non-waivable conflicts)
+    
+    # 1.1 Arbitrator identity with a party
+    for arb_id, arb_data in arbitrators.items():
+        arb_name = arb_data.get('name', 'Unknown')
+        
+        # Check if arbitrator is also a party
+        for party_id, party_data in parties.items():
+            party_name = party_data.get('name', 'Unknown')
+            if arb_name == party_name:
+                conflicts['red'].append({
+                    'type': 'identity_with_party',
+                    'arbitrator': arb_name,
+                    'party': party_name,
+                    'details': f"Arbitrator is identical with a party in the proceedings"
+                })
+        
+        # 1.2 Arbitrator as legal representative of a party
+        # This requires checking relationships for arbitrator's role in a case
+        if arb_id in arbitrator_cases:
+            for case_id in arbitrator_cases[arb_id]:
+                # Check all edges between arbitrator and case for the role
+                for s, t, data in knowledge_graph.edges([arb_id, case_id], data=True):
+                    rel_type = data.get('type', '').lower()
+                    if 'counsel' in rel_type or 'representative' in rel_type or 'lawyer' in rel_type:
+                        conflicts['red'].append({
+                            'type': 'legal_representative',
+                            'arbitrator': arb_name,
+                            'case': cases[case_id].get('name', 'Unknown case'),
+                            'details': f"Arbitrator appears to be serving as legal representative in the case"
+                        })
+    
+    # 2. ORANGE LIST (Waivable conflicts)
+    
+    # 2.1 Multiple appointments of the same arbitrator
+    for arb_id, cases_set in arbitrator_cases.items():
+        if len(cases_set) > 2:  # Arbitrator in more than 2 related cases
+            arb_name = arbitrators[arb_id].get('name', 'Unknown')
             conflicts['orange'].append({
                 'type': 'repeat_appointments',
                 'arbitrator': arb_name,
-                'details': f"Arbitrator appointed in {len(arb_data['cases'])} related cases"
+                'count': len(cases_set),
+                'details': f"Arbitrator appointed in {len(cases_set)} related cases"
             })
-        
-        # Check law firm conflicts
-        for firm in arb_data['firms']:
-            if firm in law_firms and len(law_firms[firm]['cases']) > 1:
-                conflicts['orange'].append({
-                    'type': 'law_firm_conflict',
-                    'arbitrator': arb_name,
-                    'firm': firm,
-                    'details': f"Arbitrator's firm involved in multiple related cases"
-                })
     
-    # Orange List (Waivable if parties agree)
-    for party_name, party_data in parties.items():
-        # Check party involvement in multiple cases
-        if len(party_data['cases']) > 1:
+    # 2.2 Law firm conflicts - same firm involved in multiple cases
+    for firm_id, cases_set in firm_cases.items():
+        if len(cases_set) > 1:  # Firm in more than 1 case
+            firm_name = law_firms[firm_id].get('name', 'Unknown')
+            # Check if any arbitrator is from this firm
+            for arb_id, firms_set in arbitrator_firms.items():
+                if firm_id in firms_set:
+                    arb_name = arbitrators[arb_id].get('name', 'Unknown')
+                    conflicts['orange'].append({
+                        'type': 'law_firm_conflict',
+                        'arbitrator': arb_name,
+                        'firm': firm_name,
+                        'count': len(cases_set),
+                        'details': f"Arbitrator's firm involved in multiple related cases"
+                    })
+    
+    # 2.3 Arbitrator who has been challenged before
+    for arb_id, challenges_set in arbitrator_challenges.items():
+        if len(challenges_set) > 0:
+            arb_name = arbitrators[arb_id].get('name', 'Unknown')
+            challenge_details = []
+            for challenge_id in challenges_set:
+                if challenge_id in challenges:
+                    grounds = challenges[challenge_id].get('grounds', 'Unknown grounds')
+                    outcome = challenges[challenge_id].get('outcome', 'Unknown outcome')
+                    challenge_details.append(f"{grounds} ({outcome})")
+            
             conflicts['orange'].append({
-                'type': 'multiple_cases',
-                'party': party_name,
-                'details': f"Party involved in {len(party_data['cases'])} related cases"
+                'type': 'previous_challenges',
+                'arbitrator': arb_name,
+                'count': len(challenges_set),
+                'details': f"Arbitrator has been challenged before on grounds: {', '.join(challenge_details)}"
             })
     
-    # Green List (Minor issues to disclose)
-    for firm, firm_data in law_firms.items():
-        if len(firm_data['cases']) > 1:
+    # 3. GREEN LIST (Minor issues to disclose)
+    
+    # 3.1 Law firm appearing in unrelated cases
+    for firm_id, firm_data in law_firms.items():
+        firm_name = firm_data.get('name', 'Unknown')
+        if firm_id in firm_cases and len(firm_cases[firm_id]) == 1:
             conflicts['green'].append({
-                'type': 'law_firm_multiple_cases',
-                'firm': firm,
-                'details': f"Law firm involved in {len(firm_data['cases'])} related cases"
+                'type': 'law_firm_involvement',
+                'firm': firm_name,
+                'details': f"Law firm involved in a single case in the dataset"
+            })
+    
+    # 3.2 Basic connections that might require disclosure
+    for arb_id, arb_data in arbitrators.items():
+        arb_name = arb_data.get('name', 'Unknown')
+        
+        # Only include arbitrators with just one case as a green list item
+        if arb_id in arbitrator_cases and len(arbitrator_cases[arb_id]) == 1:
+            conflicts['green'].append({
+                'type': 'single_appointment',
+                'arbitrator': arb_name,
+                'details': f"Arbitrator appointed in a single case in the dataset"
             })
     
     return conflicts
 
-def process_search_results(query, max_concurrent_cases=5):
+def process_search_results(query, max_concurrent_cases=10, max_pages="All"):
     """Process search results in parallel and update UI"""
     cases = []
     
@@ -1348,25 +1384,60 @@ def process_search_results(query, max_concurrent_cases=5):
     st.session_state.all_case_details = {}
     
     try:
-        # Fetch first page of cases
+        # Start fetching cases - first page
         with progress_container:
             st.info(f"Searching for cases matching '{query}'...")
-        page_cases = jusmundi_api.search_cases(
-            query, 
-            page=1,
-            count=10, # Limit to 10 cases for now
-            include="decisions,parties" 
-        )
         
-        if not page_cases:
+        # Initialize pagination variables
+        current_page = 1
+        has_more_pages = True
+        total_cases_found = 0
+        max_pages_reached = False
+        
+        # Convert max_pages to int if it's not "All"
+        page_limit = float('inf') if max_pages == "All" else int(max_pages)
+        
+        # Fetch all pages of cases
+        while has_more_pages and current_page <= page_limit:
             with progress_container:
-                st.warning("No results found. Please try a different search term.")
-            return
-        
-        cases.extend(page_cases)
+                st.info(f"Fetching page {current_page} of results (max: {max_pages})...")
+                
+            page_cases = jusmundi_api.search_cases(
+                query, 
+                page=current_page,
+                count=10,  # 10 cases per page
+                include="decisions,parties" 
+            )
+            
+            if not page_cases or len(page_cases) == 0:
+                has_more_pages = False
+                if current_page == 1:
+                    with progress_container:
+                        st.warning("No results found. Please try a different search term.")
+                    return
+            else:
+                cases.extend(page_cases)
+                total_cases_found += len(page_cases)
+                current_page += 1
+                
+                # Update progress
+                with progress_container:
+                    st.info(f"Found {total_cases_found} cases so far (page {current_page-1})...")
+                
+                # If we received fewer than 10 cases, assume we've reached the end
+                if len(page_cases) < 10:
+                    has_more_pages = False
+                # Check if we're about to hit our page limit
+                elif max_pages != "All" and current_page > int(max_pages):
+                    max_pages_reached = True
+                    has_more_pages = False
         
         with progress_container:
-            st.info(f"Found {len(cases)} cases. Processing in parallel...")
+            # Show message if we stopped due to page limit
+            if max_pages_reached:
+                st.warning(f"Stopped after {max_pages} pages due to your max pages setting. More results may exist.")
+            # Show total cases found
+            st.info(f"Found a total of {len(cases)} cases. Processing in parallel...")
         
         # Display cases immediately with placeholders
         with results_container:
@@ -1652,37 +1723,186 @@ def process_search_results(query, max_concurrent_cases=5):
         with analysis_container:
             st.write("## Overall Analysis")
             
-            # --- Conflict Analysis ---
-            st.write("### Conflict Analysis (Based on Loaded Data)")
-            with st.spinner("Analyzing potential conflicts based on IBA Guidelines..."):
-                # Use all_case_details from session state
-                processed_cases = [d['case'] for d in st.session_state.all_case_details.values() if d['case']]
-                all_parties_flat = [p for d in st.session_state.all_case_details.values() for p in d['parties']]
-                all_decisions_flat = [dec for d in st.session_state.all_case_details.values() for dec in d['decisions']]
-                
-                # We need a way to reconstruct party_info and decision_info from the stored lists
-                # For simplicity, we'll pass the lists and adapt the analyze_conflicts_iba function if needed
-                # OR, we recreate the dictionaries here if the function strictly requires them
-                party_info_dict = { f"{p.get('id')}": p for p in all_parties_flat }
-                decision_info_dict = { f"{dec.get('id')}": dec for dec in all_decisions_flat }
-
-                conflicts = analyze_conflicts_iba(
-                    processed_cases,
-                    party_info_dict,
-                    decision_info_dict
-                )
-                # ... (rest of conflict display code) ...
-                has_conflicts = False
-                if conflicts['red']: st.error("### ⛔ Non-Waivable Conflicts (Red List)"); [st.write(f"- **{c.get('type','N/A')}**: {c.get('details','N/A')}") for c in conflicts['red']]; has_conflicts = True
-                if conflicts['orange']: st.warning("### ⚠️ Waivable Conflicts (Orange List)"); [st.write(f"- **{c.get('type','N/A')}**: {c.get('details','N/A')}") for c in conflicts['orange']]; has_conflicts = True
-                if conflicts['green']: st.success("### ✅ Issues to Disclose (Green List)"); [st.write(f"- **{c.get('type','N/A')}**: {c.get('details','N/A')}") for c in conflicts['green']]; has_conflicts = True
-                if not has_conflicts: st.success("No significant conflicts identified based on IBA Guidelines from the loaded data.")
-
             # --- RAG System Analysis ---
-            st.write("### RAG System Analysis")
-            with st.spinner("Generating overall analysis using RAG system..."):
-                response = rag_system.get_response(query, processed_cases)
-                st.info(response)
+            st.write("### Detailed Conflict Analysis")
+            with st.spinner("Analyzing conflicts using knowledge graph data..."):
+                # Extract all entities and relations from the knowledge graph
+                kg_entities = []
+                kg_relations = []
+                
+                # Get all entities from the knowledge graph
+                for node, data in knowledge_graph.graph.nodes(data=True):
+                    entity = {
+                        "id": node,
+                        "type": data.get('type', 'unknown'),
+                        "name": data.get('name', 'Unnamed Entity'),
+                        "attributes": {k: v for k, v in data.items() if k not in ['type', 'name']}
+                    }
+                    kg_entities.append(entity)
+                
+                # Get all relations from the knowledge graph
+                for source, target, data in knowledge_graph.graph.edges(data=True):
+                    relation = {
+                        "source": source,
+                        "target": target,
+                        "type": data.get('type', 'related_to'),
+                        "attributes": {k: v for k, v in data.items() if k != 'type'}
+                    }
+                    kg_relations.append(relation)
+                
+                # Combine all entity analysis data
+                all_analysis_data = []
+                for case_id, details in st.session_state.all_case_details.items():
+                    if details.get('analysis') and details['analysis_status'] == 'success':
+                        all_analysis_data.append(details['analysis'])
+                
+                # Create comprehensive input for Gemini API
+                if kg_entities or all_analysis_data:
+                    try:
+                        # Create a prompt with all available information
+                        analysis_prompt = f"""
+                        Analyze the provided knowledge graph data to identify potential conflicts of interest in international arbitration cases.
+                        
+                        Strictly categorize all potential conflicts according to the IBA Guidelines on Conflicts of Interest:
+                        
+                        1. RED LIST (non-waivable conflicts):
+                           - Arbitrator identity with a party
+                           - Arbitrator as legal representative of a party
+                           - Arbitrator with significant financial interest in one of the parties
+                           - Arbitrator regularly advises party and derives significant income
+                        
+                        2. ORANGE LIST (waivable conflicts that should be disclosed):
+                           - Multiple appointments of the same arbitrator (more than 2 cases)
+                           - Law firm conflicts - same firm involved in multiple related cases
+                           - Prior service as arbitrator in a related case
+                           - Current services for one of the parties in unrelated matter
+                           - Relationship with another arbitrator or counsel
+                           - Arbitrator who has been challenged before
+                        
+                        3. GREEN LIST (minor issues):
+                           - Previously expressed legal opinions
+                           - Prior service in unrelated cases
+                           - Law firm appearing in unrelated cases
+                           - Basic membership in same professional associations
+                        
+                        FORMAT YOUR RESPONSE WITH THE FOLLOWING STRUCTURE:
+                        
+                        RED LIST:
+                        - [Conflict type]: [Specific entities involved] - [Clear explanation of the problem]
+                        
+                        ORANGE LIST:
+                        - [Conflict type]: [Specific entities involved] - [Clear explanation of the concern]
+                        
+                        GREEN LIST:
+                        - [Disclosure type]: [Specific entities involved] - [Brief explanation]
+                        
+                        RECOMMENDATIONS:
+                        - [Specific actions that should be taken regarding each conflict]
+                        
+                        Here is the complete knowledge graph data:
+                        
+                        Entities ({len(kg_entities)}):
+                        {json.dumps(kg_entities[:200], indent=2)}
+                        
+                        Relations ({len(kg_relations)}):
+                        {json.dumps(kg_relations[:200], indent=2)}
+                        
+                        Original search query: {query}
+                        """
+                        
+                        # Call Gemini API with all the knowledge graph data
+                        rag_response = client.models.generate_content(
+                            model="gemini-2.0-flash",
+                            contents=analysis_prompt,
+                            config=genai.types.GenerateContentConfig(
+                                temperature=0.1,
+                                max_output_tokens=6000,
+                                top_p=0.95,
+                                top_k=40
+                            )
+                        )
+                        
+                        # Display results in an expandable section
+                        if rag_response.text:
+                            response_text = rag_response.text
+                            
+                            # Extract sections for highlighting
+                            red_list_section = ""
+                            orange_list_section = ""
+                            green_list_section = ""
+                            recommendations_section = ""
+                            
+                            if "RED LIST:" in response_text:
+                                red_parts = response_text.split("RED LIST:")
+                                if len(red_parts) > 1:
+                                    next_section = next((s for s in ["ORANGE LIST:", "GREEN LIST:", "RECOMMENDATIONS:"] 
+                                                       if s in red_parts[1]), None)
+                                    if next_section:
+                                        red_list_section = red_parts[1].split(next_section)[0].strip()
+                                    else:
+                                        red_list_section = red_parts[1].strip()
+                            
+                            if "ORANGE LIST:" in response_text:
+                                orange_parts = response_text.split("ORANGE LIST:")
+                                if len(orange_parts) > 1:
+                                    next_section = next((s for s in ["GREEN LIST:", "RECOMMENDATIONS:"] 
+                                                       if s in orange_parts[1]), None)
+                                    if next_section:
+                                        orange_list_section = orange_parts[1].split(next_section)[0].strip()
+                                    else:
+                                        orange_list_section = orange_parts[1].strip()
+                            
+                            if "GREEN LIST:" in response_text:
+                                green_parts = response_text.split("GREEN LIST:")
+                                if len(green_parts) > 1:
+                                    if "RECOMMENDATIONS:" in green_parts[1]:
+                                        green_list_section = green_parts[1].split("RECOMMENDATIONS:")[0].strip()
+                                    else:
+                                        green_list_section = green_parts[1].strip()
+                            
+                            if "RECOMMENDATIONS:" in response_text:
+                                recommendations_section = response_text.split("RECOMMENDATIONS:")[1].strip()
+                            
+                            # Display each section with appropriate styling
+                            if red_list_section:
+                                st.error("### ⛔ RED LIST (Non-Waivable Conflicts)")
+                                st.markdown(red_list_section)
+                            
+                            if orange_list_section:
+                                st.warning("### ⚠️ ORANGE LIST (Waivable Conflicts)")
+                                st.markdown(orange_list_section)
+                            
+                            if green_list_section:
+                                st.success("### ✅ GREEN LIST (Minor Issues)")
+                                st.markdown(green_list_section)
+                            
+                            if recommendations_section:
+                                st.info("### 📋 RECOMMENDATIONS")
+                                st.markdown(recommendations_section)
+                            
+                            # If no sections were found, display the full response
+                            if not any([red_list_section, orange_list_section, green_list_section, recommendations_section]):
+                                st.info(response_text)
+                        else:
+                            st.info("No analysis could be generated based on the extracted data.")
+                    except Exception as e:
+                        logger.error(f"Error in RAG analysis using knowledge graph: {str(e)}")
+                        st.error(f"Error generating analysis: {str(e)}")
+                else:
+                    st.info("Insufficient data in knowledge graph to perform analysis. Try searching for more cases.")
+                
+                # Add visualization of the knowledge graph button
+                if knowledge_graph.graph.number_of_nodes() > 0:
+                    if st.button("Visualize Conflict Network"):
+                        graph_file = generate_network_graph(knowledge_graph.graph)
+                        if graph_file:
+                            with open(graph_file, 'r', encoding='utf-8') as f:
+                                html_data = f.read()
+                            st.components.v1.html(html_data, height=800)
+                            try:
+                                os.unlink(graph_file)
+                            except Exception:
+                                pass
         
         # Final status update
         with progress_container:
@@ -1744,6 +1964,15 @@ with tab1:
     
     # Add filters in sidebar
     st.sidebar.header("Filters")
+    
+    # Add max pages control
+    max_pages = st.sidebar.selectbox(
+        "Maximum Pages to Search",
+        ["1", "2", "5", "All"],
+        index=3,  # Default to "All"
+        help="Limit the number of result pages to fetch. Each page contains 10 cases."
+    )
+    
     status_filter = st.sidebar.multiselect(
         "Case Status",
         ["Pending", "Concluded", "Discontinued", "All"],
@@ -1767,7 +1996,7 @@ with tab1:
         if not query:
             st.warning("Please enter a search term.")
         else:
-            process_search_results(query)
+            process_search_results(query, max_pages=max_pages)
 
 with tab2:
     st.subheader("Knowledge Graph Visualization")
@@ -1867,9 +2096,22 @@ with st.sidebar:
     except Exception as e:
         st.error(f"❌ Gemini API Error: {str(e)}")
     
+    try:
+        # Try Groq API
+        test_completion = groq_client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{"role": "user", "content": "test"}],
+            max_tokens=10
+        )
+        st.success("✅ Groq API Connected")
+    except Exception as e:
+        st.error(f"❌ Groq API Error: {str(e)}")
+    
     # API Info
     st.subheader("API Configuration")
     st.write(f"- Base URL: {jusmundi_api.base_url}")
+    st.write(f"- Groq Model: meta-llama/llama-4-scout-17b-16e-instruct")
+    st.write(f"- Gemini Model: gemini-2.0-flash")
     
     # Graph Statistics
     st.subheader("Graph Statistics")
