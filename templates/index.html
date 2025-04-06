@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Arbitrator Challenge Analysis</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto px-4 py-8">
+        <header class="text-center mb-8">
+            <h1 class="text-4xl font-bold text-gray-800">Arbitrator Challenge Analysis</h1>
+            <p class="text-gray-600 mt-2">Analyze conflicts of interest in international arbitration</p>
+        </header>
+
+        <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+            <div class="flex flex-col md:flex-row gap-4">
+                <input type="text" 
+                       id="searchInput" 
+                       placeholder="Search for arbitrator challenges..." 
+                       class="flex-grow p-3 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <button onclick="search()" 
+                        class="bg-blue-500 text-white px-6 py-3 rounded-lg hover:bg-blue-600 transition-colors">
+                    Search
+                </button>
+            </div>
+        </div>
+
+        <div id="results" class="space-y-6">
+            <!-- Results will be populated here -->
+        </div>
+
+        <div id="loading" class="hidden text-center py-8">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto"></div>
+            <p class="mt-4 text-gray-600">Analyzing cases...</p>
+        </div>
+    </div>
+
+    <script>
+        async function search() {
+            const query = document.getElementById('searchInput').value;
+            if (!query) return;
+
+            const resultsDiv = document.getElementById('results');
+            const loadingDiv = document.getElementById('loading');
+
+            resultsDiv.innerHTML = '';
+            loadingDiv.classList.remove('hidden');
+
+            try {
+                const response = await fetch('/search', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ query }),
+                });
+
+                const data = await response.json();
+
+                loadingDiv.classList.add('hidden');
+
+                if (data.error) {
+                    resultsDiv.innerHTML = `<div class="text-red-500">${data.error}</div>`;
+                    return;
+                }
+
+                // Display RAG response
+                resultsDiv.innerHTML += `
+                    <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+                        <h2 class="text-xl font-semibold mb-4">Analysis</h2>
+                        <p class="text-gray-700">${data.response}</p>
+                    </div>
+                `;
+
+                // Display cases
+                data.cases.forEach(caseData => {
+                    let arbitratorsHtml = '';
+                    if (caseData.arbitrators && caseData.arbitrators.length > 0) {
+                        arbitratorsHtml = `
+                            <div class="mt-4">
+                                <h4 class="font-medium mb-2">Arbitrators:</h4>
+                                <div class="space-y-2">
+                                    ${caseData.arbitrators.map(arbitrator => `
+                                        <div class="bg-gray-50 p-3 rounded">
+                                            <p class="font-medium">${arbitrator.name || 'Unknown'}</p>
+                                            ${arbitrator.challenges ? `
+                                                <div class="mt-2">
+                                                    <p class="text-sm text-gray-600">Challenges: ${arbitrator.challenges.length}</p>
+                                                    ${arbitrator.challenges.map(challenge => `
+                                                        <div class="ml-4 mt-1 text-sm">
+                                                            <p>• ${challenge.grounds || 'No grounds specified'}</p>
+                                                            <p class="text-gray-500">Outcome: ${challenge.outcome || 'Unknown'}</p>
+                                                        </div>
+                                                    `).join('')}
+                                                </div>
+                                            ` : ''}
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        `;
+                    }
+
+                    let relatedCasesHtml = '';
+                    if (caseData.related_cases && caseData.related_cases.length > 0) {
+                        relatedCasesHtml = `
+                            <div class="mt-4">
+                                <h4 class="font-medium mb-2">Related Cases:</h4>
+                                <div class="space-y-2">
+                                    ${caseData.related_cases.map(relatedCase => `
+                                        <div class="bg-gray-50 p-3 rounded">
+                                            <p class="font-medium">${relatedCase.title || 'Untitled Case'}</p>
+                                            <p class="text-sm text-gray-600">${relatedCase.date || 'Date unknown'}</p>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        `;
+                    }
+
+                    resultsDiv.innerHTML += `
+                        <div class="bg-white rounded-lg shadow-md p-6">
+                            <h3 class="text-lg font-semibold mb-2">${caseData.title || 'Untitled Case'}</h3>
+                            <div class="grid grid-cols-1 gap-4">
+                                <div>
+                                    <p class="text-gray-600">Date: ${caseData.date || 'Unknown'}</p>
+                                    <p class="text-gray-600">Status: ${caseData.status || 'Unknown'}</p>
+                                </div>
+                                <div>
+                                    <h4 class="font-medium mb-2">Challenge Grounds:</h4>
+                                    <p class="text-gray-700">${caseData.challenge_grounds || 'No grounds specified'}</p>
+                                </div>
+                                ${arbitratorsHtml}
+                                ${relatedCasesHtml}
+                            </div>
+                        </div>
+                    `;
+                });
+            } catch (error) {
+                loadingDiv.classList.add('hidden');
+                resultsDiv.innerHTML = `<div class="text-red-500">Error: ${error.message}</div>`;
+            }
+        }
+    </script>
+</body>
+</html> 
