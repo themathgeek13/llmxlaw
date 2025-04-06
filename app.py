@@ -1,12 +1,18 @@
 from flask import Flask, render_template, request, jsonify
 from dotenv import load_dotenv
 import os
+import google.generativeai as genai
 from jusmundi_api import JusMundiAPI
 from knowledge_graph import KnowledgeGraph
 from rag_system import RAGSystem
+from pyvis.network import Network
+import networkx as nx
 
 # Load environment variables
 load_dotenv()
+
+# Initialize Gemini
+genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 
 app = Flask(__name__)
 
@@ -18,6 +24,41 @@ rag_system = RAGSystem(knowledge_graph)
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/visualize')
+def visualize():
+    # Create a Pyvis network
+    net = Network(height="750px", width="100%", bgcolor="#ffffff", font_color="black")
+    
+    # Add nodes and edges from the knowledge graph
+    for node in knowledge_graph.graph.nodes():
+        node_data = knowledge_graph.graph.nodes[node]
+        if node_data['type'] == 'case':
+            net.add_node(node, 
+                        label=node_data.get('title', 'Unknown Case'),
+                        color='#FF9999',
+                        shape='box')
+        elif node_data['type'] == 'arbitrator':
+            net.add_node(node,
+                        label=node_data.get('name', 'Unknown Arbitrator'),
+                        color='#99FF99',
+                        shape='ellipse')
+        elif node_data['type'] == 'challenge':
+            net.add_node(node,
+                        label=node_data.get('grounds', 'Unknown Challenge'),
+                        color='#9999FF',
+                        shape='diamond')
+    
+    # Add edges
+    for edge in knowledge_graph.graph.edges():
+        edge_data = knowledge_graph.graph.edges[edge]
+        net.add_edge(edge[0], edge[1], 
+                    title=edge_data.get('type', ''),
+                    color='#CCCCCC')
+    
+    # Generate the HTML
+    net.save_graph("templates/graph.html")
+    return render_template('graph.html')
 
 @app.route('/search', methods=['POST'])
 def search():

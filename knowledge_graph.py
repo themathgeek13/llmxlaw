@@ -1,82 +1,101 @@
-from neo4j import GraphDatabase
+import networkx as nx
 from typing import List, Dict, Any
 
 class KnowledgeGraph:
     def __init__(self):
-        self.driver = GraphDatabase.driver(
-            "bolt://localhost:7687",
-            auth=("neo4j", "password")  # Replace with your Neo4j credentials
-        )
+        self.graph = nx.Graph()
+        self.case_nodes = set()
+        self.arbitrator_nodes = set()
 
     def update_graph(self, cases: List[Dict[str, Any]]):
         """
         Update the knowledge graph with new cases
         """
-        with self.driver.session() as session:
+        for case in cases:
+            case_id = case.get('id')
+            if not case_id:
+                continue
+
+            # Add case node if not exists
+            if case_id not in self.case_nodes:
+                self.graph.add_node(case_id, 
+                                  type='case',
+                                  title=case.get('title'),
+                                  date=case.get('date'),
+                                  outcome=case.get('outcome'),
+                                  challenge_grounds=case.get('challenge_grounds'))
+                self.case_nodes.add(case_id)
+
+            # Add arbitrator nodes and relationships
+            for arbitrator in case.get('arbitrators', []):
+                arbitrator_id = arbitrator.get('id')
+                if not arbitrator_id:
+                    continue
+
+                # Add arbitrator node if not exists
+                if arbitrator_id not in self.arbitrator_nodes:
+                    self.graph.add_node(arbitrator_id,
+                                      type='arbitrator',
+                                      name=arbitrator.get('name'))
+                    self.arbitrator_nodes.add(arbitrator_id)
+
+                # Add relationship between case and arbitrator
+                self.graph.add_edge(case_id, arbitrator_id,
+                                  role=arbitrator.get('role'))
+
+                # Add challenge relationships
+                for challenge in arbitrator.get('challenges', []):
+                    challenge_id = f"{arbitrator_id}_challenge_{len(arbitrator.get('challenges', []))}"
+                    self.graph.add_node(challenge_id,
+                                      type='challenge',
+                                      grounds=challenge.get('grounds'),
+                                      outcome=challenge.get('outcome'))
+                    self.graph.add_edge(arbitrator_id, challenge_id)
+
+    def get_related_cases(self, case_id: str) -> List[Dict[str, Any]]:
+        """
+        Get cases related to a specific case through arbitrators
+        """
+        if case_id not in self.graph:
+            return []
+
+        related_cases = []
+        # Get all arbitrators in the case
+        arbitrators = [n for n in self.graph.neighbors(case_id) 
+                      if self.graph.nodes[n]['type'] == 'arbitrator']
+        
+        # For each arbitrator, find other cases they're involved in
+        for arbitrator in arbitrators:
+            cases = [n for n in self.graph.neighbors(arbitrator)
+                    if self.graph.nodes[n]['type'] == 'case' and n != case_id]
             for case in cases:
-                # Create case node
-                session.write_transaction(
-                    self._create_case_node,
-                    case
-                )
-                
-                # Create relationships with arbitrators
-                for arbitrator in case.get('arbitrators', []):
-                    session.write_transaction(
-                        self._create_arbitrator_relationship,
-                        case['id'],
-                        arbitrator
-                    )
+                case_data = self.graph.nodes[case]
+                related_cases.append({
+                    'id': case,
+                    'title': case_data.get('title'),
+                    'date': case_data.get('date'),
+                    'outcome': case_data.get('outcome')
+                })
 
-    @staticmethod
-    def _create_case_node(tx, case: Dict[str, Any]):
-        query = """
-        MERGE (c:Case {id: $id})
-        SET c.title = $title,
-            c.date = $date,
-            c.outcome = $outcome,
-            c.challenge_grounds = $challenge_grounds
-        """
-        tx.run(query, {
-            'id': case['id'],
-            'title': case.get('title'),
-            'date': case.get('date'),
-            'outcome': case.get('challenge_outcome'),
-            'challenge_grounds': case.get('challenge_grounds')
-        })
+        return related_cases
 
-    @staticmethod
-    def _create_arbitrator_relationship(tx, case_id: str, arbitrator: Dict[str, Any]):
-        query = """
-        MATCH (c:Case {id: $case_id})
-        MERGE (a:Arbitrator {id: $arbitrator_id})
-        SET a.name = $name
-        MERGE (a)-[r:ARBITRATED_IN]->(c)
-        SET r.role = $role
+    def get_arbitrator_challenges(self, arbitrator_id: str) -> List[Dict[str, Any]]:
         """
-        tx.run(query, {
-            'case_id': case_id,
-            'arbitrator_id': arbitrator['id'],
-            'name': arbitrator.get('name'),
-            'role': arbitrator.get('role')
-        })
+        Get all challenges related to a specific arbitrator
+        """
+        if arbitrator_id not in self.graph:
+            return []
 
-    def get_related_cases(self, arbitrator_id: str) -> List[Dict[str, Any]]:
-        """
-        Get all cases related to a specific arbitrator
-        """
-        with self.driver.session() as session:
-            result = session.read_transaction(
-                self._get_related_cases,
-                arbitrator_id
-            )
-            return result
+        challenges = []
+        # Get all challenge nodes connected to the arbitrator
+        challenge_nodes = [n for n in self.graph.neighbors(arbitrator_id)
+                         if self.graph.nodes[n]['type'] == 'challenge']
+        
+        for challenge in challenge_nodes:
+            challenge_data = self.graph.nodes[challenge]
+            challenges.append({
+                'grounds': challenge_data.get('grounds'),
+                'outcome': challenge_data.get('outcome')
+            })
 
-    @staticmethod
-    def _get_related_cases(tx, arbitrator_id: str):
-        query = """
-        MATCH (a:Arbitrator {id: $arbitrator_id})-[:ARBITRATED_IN]->(c:Case)
-        RETURN c
-        """
-        result = tx.run(query, arbitrator_id=arbitrator_id)
-        return [dict(record['c']) for record in result] 
+        return challenges 
