@@ -1,5 +1,7 @@
 # LLM x Law: Jus Mundi Confilict Arbitrator Challenge Analysis
 
+🏆 **WINNER - Stanford CodeX LegalTech Hackathon 2024**
+
 A sophisticated knowledge graph based RAG system for analyzing conflicts of interest in international arbitration, leveraging multiple LLMs and interactive visualization. Built for the Stanford CodeX LegalTech Hackathon.
 
 ## Key Features
@@ -95,4 +97,9 @@ MIT
 
 ## Team
 
-Created for Stanford CodeX LegalTech Hackathon
+🏆 **Winner of Stanford CodeX LegalTech Hackathon 2025**
+
+Created with passion by our team during the Stanford CodeX LegalTech Hackathon, where we were honored to be selected as the winning project for our innovative approach to legal technology and arbitration analysis.
+
+
+
