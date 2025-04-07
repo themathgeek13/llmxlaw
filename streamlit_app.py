@@ -28,10 +28,14 @@ import threading
 import re
 import math
 from groq import Groq
+import pickle
 
 from jusmundi_api import JusMundiAPI
 from knowledge_graph import KnowledgeGraph
 from rag_system import RAGSystem
+
+# Path to save the knowledge graph
+KG_SAVE_PATH = "data/knowledge_graph.pickle"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -96,6 +100,36 @@ if 'entity_analysis' not in st.session_state:
 if 'cases_counter' not in st.session_state:
     st.session_state.cases_counter = ThreadSafeCounter()
 
+# Function to save knowledge graph to file
+def save_knowledge_graph(kg):
+    """Save knowledge graph to a file"""
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(KG_SAVE_PATH), exist_ok=True)
+    
+    try:
+        # Serialize and save the graph
+        with open(KG_SAVE_PATH, 'wb') as f:
+            pickle.dump(kg.graph, f)
+        logger.info(f"Knowledge graph saved to {KG_SAVE_PATH} with {kg.graph.number_of_nodes()} nodes and {kg.graph.number_of_edges()} edges")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving knowledge graph: {e}")
+        return False
+
+# Function to load knowledge graph from file
+def load_knowledge_graph():
+    """Load knowledge graph from file if it exists"""
+    try:
+        if os.path.exists(KG_SAVE_PATH):
+            with open(KG_SAVE_PATH, 'rb') as f:
+                graph = pickle.load(f)
+                logger.info(f"Knowledge graph loaded from {KG_SAVE_PATH} with {graph.number_of_nodes()} nodes and {graph.number_of_edges()} edges")
+                return graph
+        return None
+    except Exception as e:
+        logger.error(f"Error loading knowledge graph: {e}")
+        return None
+
 # Initialize components
 @st.cache_resource(ttl=0)  # Set TTL to 0 to prevent caching
 def init_components():
@@ -115,10 +149,19 @@ def init_components():
         st.cache_resource.clear()
         api = JusMundiAPI(api_key=api_key)
     
+    # Try to load knowledge graph from file, or create a new one
+    kg = KnowledgeGraph()
+    
+    # Load from file if exists
+    saved_graph = load_knowledge_graph()
+    if saved_graph is not None:
+        kg.graph = saved_graph
+        logger.info(f"Loaded knowledge graph with {kg.graph.number_of_nodes()} nodes and {kg.graph.number_of_edges()} edges")
+    
     return (
         api,
-        KnowledgeGraph(),
-        RAGSystem(KnowledgeGraph())
+        kg,
+        RAGSystem(kg)  # Pass the same knowledge graph instance
     )
 
 # Add a button to clear cache
@@ -2154,8 +2197,11 @@ if 'placeholders' not in st.session_state:
 if 'status_placeholders' not in st.session_state:
     st.session_state.status_placeholders = {}
 
+# Initialize components - This creates and caches a single knowledge graph instance
+jusmundi_api, knowledge_graph, rag_system = init_components()
+
 # Create tabs
-tab1, tab2 = st.tabs(["Search & Analysis", "Knowledge Graph"])
+tab1, tab2, tab3 = st.tabs(["Search & Analysis", "Knowledge Graph", "Chat Assistant"])
 
 # Initialize session state
 if 'searched_cases' not in st.session_state:
@@ -2164,6 +2210,183 @@ if 'all_cases' not in st.session_state:
     st.session_state.all_cases = []
 if 'last_fetch_time' not in st.session_state:
     st.session_state.last_fetch_time = None
+
+# Initialize chat history in session state if not already present
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
+
+def get_relevant_context(query, knowledge_graph):
+    """Extract relevant context from knowledge graph based on user query"""
+    context = []
+    
+    # Check if knowledge graph has data
+    if knowledge_graph.graph.number_of_nodes() == 0:
+        context.append({
+            "type": "empty_graph",
+            "content": "The knowledge graph is currently empty. Please search for and analyze cases in the Search & Analysis tab to populate the graph."
+        })
+        return context
+    
+    # Get all nodes and their attributes
+    nodes_data = []
+    for node, data in knowledge_graph.graph.nodes(data=True):
+        node_info = {
+            "id": node,
+            "type": data.get('type', 'unknown'),
+            "name": data.get('name', 'Unnamed'),
+            "attributes": {k: v for k, v in data.items() if k not in ['type', 'name']}
+        }
+        nodes_data.append(node_info)
+    
+    # Get all edges and their attributes
+    edges_data = []
+    for source, target, data in knowledge_graph.graph.edges(data=True):
+        edge_info = {
+            "source": source,
+            "target": target,
+            "type": data.get('type', 'related_to'),
+            "attributes": {k: v for k, v in data.items() if k != 'type'}
+        }
+        edges_data.append(edge_info)
+    
+    # Create a summary of the knowledge graph state
+    context.append({
+        "type": "graph_summary",
+        "content": f"Knowledge Graph contains {len(nodes_data)} entities and {len(edges_data)} relationships."
+    })
+    
+    # Add node type distribution
+    node_types = {}
+    for node in nodes_data:
+        node_type = node['type']
+        node_types[node_type] = node_types.get(node_type, 0) + 1
+    
+    context.append({
+        "type": "entity_distribution",
+        "content": "Entity types in knowledge graph: " + 
+                  ", ".join([f"{type}: {count}" for type, count in node_types.items()])
+    })
+    
+    # Try to find relevant entities based on query terms
+    query_terms = query.lower().split()
+    relevant_nodes = []
+    
+    for node in nodes_data:
+        node_text = f"{node['name']} {' '.join(str(v) for v in node['attributes'].values())}".lower()
+        if any(term in node_text for term in query_terms):
+            relevant_nodes.append(node)
+    
+    if relevant_nodes:
+        context.append({
+            "type": "relevant_entities",
+            "content": "Relevant entities found: " + 
+                      ", ".join([f"{node['name']} ({node['type']})" for node in relevant_nodes[:5]])
+        })
+        
+        # Add detailed information for most relevant entities
+        for node in relevant_nodes[:3]:  # Limit to top 3 most relevant
+            # Get connected nodes
+            connected_nodes = []
+            for edge in edges_data:
+                if edge['source'] == node['id']:
+                    target_node = next((n for n in nodes_data if n['id'] == edge['target']), None)
+                    if target_node:
+                        connected_nodes.append({
+                            "node": target_node,
+                            "relationship": edge['type']
+                        })
+                elif edge['target'] == node['id']:
+                    source_node = next((n for n in nodes_data if n['id'] == edge['source']), None)
+                    if source_node:
+                        connected_nodes.append({
+                            "node": source_node,
+                            "relationship": edge['type']
+                        })
+            
+            # Add detailed context for this entity
+            entity_context = f"Details for {node['name']} ({node['type']}):\n"
+            entity_context += f"Attributes: {json.dumps(node['attributes'], indent=2)}\n"
+            if connected_nodes:
+                entity_context += "Related entities:\n"
+                for conn in connected_nodes:
+                    entity_context += f"- {conn['node']['name']} ({conn['relationship']})\n"
+            
+            context.append({
+                "type": "entity_details",
+                "content": entity_context
+            })
+    
+    return context
+
+def format_context_for_prompt(context):
+    """Format the context into a string for the prompt"""
+    # Check for empty graph case
+    if context and context[0].get('type') == 'empty_graph':
+        return "The knowledge graph is currently empty. Please search for and analyze cases in the Search & Analysis tab to populate the graph with legal entities and relationships."
+    
+    formatted_context = "Here is the relevant information from the knowledge graph:\n\n"
+    
+    for item in context:
+        if item['type'] == 'graph_summary':
+            formatted_context += f"Overview: {item['content']}\n\n"
+        elif item['type'] == 'entity_distribution':
+            formatted_context += f"Distribution: {item['content']}\n\n"
+        elif item['type'] == 'relevant_entities':
+            formatted_context += f"Relevant Entities: {item['content']}\n\n"
+        elif item['type'] == 'entity_details':
+            formatted_context += f"Detailed Information:\n{item['content']}\n\n"
+    
+    return formatted_context
+
+def generate_assistant_response(prompt, context):
+    """Generate a response using Gemini with context from the knowledge graph"""
+    
+    # Format context and create the full prompt
+    formatted_context = format_context_for_prompt(context)
+    
+    system_prompt = """You are an expert legal assistant specializing in international arbitration.
+    You have access to a knowledge graph containing information about arbitration cases, parties, arbitrators, and their relationships.
+    Use the provided context to give accurate, well-informed responses.
+    If you're not sure about something, say so clearly.
+    Always cite specific entities or relationships from the knowledge graph when relevant.
+    Format your responses using markdown for better readability."""
+    
+    full_prompt = f"""Context from Knowledge Graph:
+    {formatted_context}
+    
+    User Question: {prompt}
+    
+    Please provide a detailed response based on the available information."""
+    
+    try:
+        # Combine system prompt and user prompt into a single string
+        combined_prompt = f"{system_prompt}\n\n{full_prompt}"
+        
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=combined_prompt,  # Send as a single string
+            config=GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=4000,
+                top_p=0.95,
+                top_k=40,
+                tools=[google_search_tool],
+                response_modalities=["TEXT"]
+            )
+        )
+        
+        if hasattr(response, 'candidates') and response.candidates:
+            response_text = ""
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'text'):
+                    response_text += part.text
+            return response_text
+        else:
+            return "I apologize, but I couldn't generate a response at this time. Please try rephrasing your question."
+            
+    except Exception as e:
+        logger.error(f"Error generating response: {str(e)}")
+        return f"I encountered an error while generating a response: {str(e)}"
 
 with tab1:
     # Search interface
@@ -2217,9 +2440,19 @@ with tab1:
             st.warning("Please enter a search term.")
         else:
             process_search_results(query, max_pages=max_pages)
+            
+            # Save the knowledge graph after search results are processed
+            save_knowledge_graph(knowledge_graph)
 
 with tab2:
     st.subheader("Knowledge Graph Visualization")
+    
+    # Add save button
+    if st.button("Save Knowledge Graph"):
+        if save_knowledge_graph(knowledge_graph):
+            st.success(f"✅ Knowledge Graph saved with {knowledge_graph.graph.number_of_nodes()} nodes and {knowledge_graph.graph.number_of_edges()} edges")
+        else:
+            st.error("❌ Failed to save Knowledge Graph")
     
     # Add graph filters with expanded defaults
     st.sidebar.header("Graph Filters")
@@ -2292,6 +2525,51 @@ with tab2:
                     import pandas as pd
                     df = pd.DataFrame(entities)
                     st.dataframe(df)
+
+with tab3:
+    st.header("Chat with Legal Assistant")
+    
+    # Display knowledge graph status information using the direct knowledge_graph variable
+    kg_nodes = knowledge_graph.graph.number_of_nodes()
+    kg_edges = knowledge_graph.graph.number_of_edges()
+    
+    # Try to load the knowledge graph from file if it's empty
+    if kg_nodes == 0:
+        saved_graph = load_knowledge_graph()
+        if saved_graph is not None:
+            knowledge_graph.graph = saved_graph
+            kg_nodes = knowledge_graph.graph.number_of_nodes()
+            kg_edges = knowledge_graph.graph.number_of_edges()
+            st.success(f"✅ Knowledge Graph loaded from file with {kg_nodes} nodes and {kg_edges} relationships")
+        else:
+            st.warning("⚠️ The knowledge graph is empty. Please search for and analyze cases in the Search & Analysis tab first.")
+    else:
+        st.success(f"✅ Knowledge Graph has {kg_nodes} entities and {kg_edges} relationships available for context.")
+    
+    st.write("Ask questions about arbitration cases and conflicts of interest. I'll use the knowledge graph to provide context-aware responses.")
+    
+    # Display chat messages from history
+    for message in st.session_state.chat_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # Accept user input
+    if prompt := st.chat_input("Ask a question about arbitration cases..."):
+        # Display user message
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        # Add user message to chat history
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        
+        # Get relevant context from the directly initialized knowledge_graph
+        context = get_relevant_context(prompt, knowledge_graph)
+        
+        # Display assistant response
+        with st.chat_message("assistant"):
+            response = generate_assistant_response(prompt, context)
+            st.markdown(response)
+        # Add assistant response to chat history
+        st.session_state.chat_messages.append({"role": "assistant", "content": response})
 
 # Add debug information in sidebar
 with st.sidebar:
@@ -2375,7 +2653,17 @@ with st.sidebar:
     # Clear Graph button
     if st.button("Clear Knowledge Graph"):
         knowledge_graph.graph.clear()
-        st.success("Graph cleared!")
+        
+        # Also delete the saved file if it exists
+        if os.path.exists(KG_SAVE_PATH):
+            try:
+                os.remove(KG_SAVE_PATH)
+                st.success("Graph cleared and saved file deleted!")
+            except Exception as e:
+                st.error(f"Graph cleared but could not delete saved file: {e}")
+        else:
+            st.success("Graph cleared!")
+        
         st.rerun()
     
     # Clear session state button
