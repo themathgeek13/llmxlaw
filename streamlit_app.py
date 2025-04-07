@@ -10,6 +10,7 @@ st.set_page_config(
 import os
 from dotenv import load_dotenv
 from google import genai
+from google.genai.types import Tool, GenerateContentConfig, GoogleSearch
 import networkx as nx
 import matplotlib.pyplot as plt
 from pyvis.network import Network
@@ -44,6 +45,11 @@ client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
 
 # Initialize Groq
 groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
+
+# Initialize Google Search Tool
+google_search_tool = Tool(
+    google_search = GoogleSearch()
+)
 
 # Initialize thread-safe data structures
 class ThreadSafeCounter:
@@ -1506,23 +1512,23 @@ def process_search_results(query, max_concurrent_cases=10, max_pages="All"):
                         st.info(f"Processed {processed_count}/{len(cases)} cases")
                         
                     # Update stats in real-time from main thread
-                    with stats_container:
-                        st.write("## Case Statistics")
-                        status_counts = {}
-                        current_cases_data = list(st.session_state.all_case_details.values())
-                        for c_data in current_cases_data:
-                            if c_data and c_data.get('case'):
-                                status = c_data['case'].get('attributes', {}).get('outcome', 'Unknown')
-                                status_counts[status] = status_counts.get(status, 0) + 1
+                    # with stats_container:
+                    #     st.write("## Case Statistics")
+                    #     status_counts = {}
+                    #     current_cases_data = list(st.session_state.all_case_details.values())
+                    #     for c_data in current_cases_data:
+                    #         if c_data and c_data.get('case'):
+                    #             status = c_data['case'].get('attributes', {}).get('outcome', 'Unknown')
+                    #             status_counts[status] = status_counts.get(status, 0) + 1
                         
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("Total Cases Found", len(cases))
-                        col2.metric("Processed Cases", st.session_state.cases_counter.value)
-                        col3.metric("Pending Cases", len(cases) - st.session_state.cases_counter.value)
+                    #     col1, col2, col3 = st.columns(3)
+                    #     col1.metric("Total Cases Found", len(cases))
+                    #     col2.metric("Processed Cases", st.session_state.cases_counter.value)
+                    #     col3.metric("Pending Cases", len(cases) - st.session_state.cases_counter.value)
                         
-                        st.write("\n**Case Status Breakdown (Processed Cases):**")
-                        if status_counts: [st.write(f"- {status}: {count}") for status, count in status_counts.items()]
-                        else: st.write("-")
+                    #     st.write("\n**Case Status Breakdown (Processed Cases):**")
+                    #     if status_counts: [st.write(f"- {status}: {count}") for status, count in status_counts.items()]
+                    #     else: st.write("-")
                 
                 except Exception as e:
                     logger.error(f"Error processing case: {str(e)}")
@@ -1725,7 +1731,7 @@ def process_search_results(query, max_concurrent_cases=10, max_pages="All"):
             
             # --- RAG System Analysis ---
             st.write("### Detailed Conflict Analysis")
-            with st.spinner("Analyzing conflicts using knowledge graph data..."):
+            with st.spinner("Analyzing conflicts using knowledge graph data and grounding with web search..."):
                 # Extract all entities and relations from the knowledge graph
                 kg_entities = []
                 kg_relations = []
@@ -1785,16 +1791,23 @@ def process_search_results(query, max_concurrent_cases=10, max_pages="All"):
                            - Law firm appearing in unrelated cases
                            - Basic membership in same professional associations
                         
+                        IMPORTANT: For any potential conflict that requires deeper research (e.g., relationships between arbitrators and parties that are not explicitly stated in the data), use web search to find more information and verify the potential conflict. Focus especially on:
+                        1. Arbitrator professional histories and affiliations
+                        2. Company ownership structures and subsidiaries
+                        3. Prior relationships between arbitrators and parties
+                        4. Law firm mergers or changes that might create conflicts
+                        5. Additional details about challenge grounds or outcomes
+                        
                         FORMAT YOUR RESPONSE WITH THE FOLLOWING STRUCTURE:
                         
                         RED LIST:
-                        - [Conflict type]: [Specific entities involved] - [Clear explanation of the problem]
+                        - [Conflict type]: [Specific entities involved] - [Clear explanation of the problem, with citations to web sources where appropriate]
                         
                         ORANGE LIST:
-                        - [Conflict type]: [Specific entities involved] - [Clear explanation of the concern]
+                        - [Conflict type]: [Specific entities involved] - [Clear explanation of the concern, with citations to web sources where appropriate]
                         
                         GREEN LIST:
-                        - [Disclosure type]: [Specific entities involved] - [Brief explanation]
+                        - [Disclosure type]: [Specific entities involved] - [Brief explanation, with citations to web sources where appropriate]
                         
                         RECOMMENDATIONS:
                         - [Specific actions that should be taken regarding each conflict]
@@ -1810,20 +1823,227 @@ def process_search_results(query, max_concurrent_cases=10, max_pages="All"):
                         Original search query: {query}
                         """
                         
-                        # Call Gemini API with all the knowledge graph data
+                        # Call Gemini API with knowledge graph data and Google Search grounding
                         rag_response = client.models.generate_content(
                             model="gemini-2.0-flash",
                             contents=analysis_prompt,
-                            config=genai.types.GenerateContentConfig(
+                            config=GenerateContentConfig(
                                 temperature=0.1,
                                 max_output_tokens=6000,
                                 top_p=0.95,
-                                top_k=40
+                                top_k=40,
+                                tools=[google_search_tool],
+                                response_modalities=["TEXT"]
                             )
                         )
                         
                         # Display results in an expandable section
-                        if rag_response.text:
+                        if hasattr(rag_response, 'candidates') and rag_response.candidates:
+                            response_text = ""
+                            for part in rag_response.candidates[0].content.parts:
+                                if hasattr(part, 'text'):
+                                    response_text += part.text
+                            
+                            # Extract grounding metadata if available
+                            grounding_info = None
+                            try:
+                                if hasattr(rag_response.candidates[0], 'grounding_metadata') and \
+                                   hasattr(rag_response.candidates[0].grounding_metadata, 'search_entry_point') and \
+                                   hasattr(rag_response.candidates[0].grounding_metadata.search_entry_point, 'rendered_content'):
+                                    grounding_info = rag_response.candidates[0].grounding_metadata.search_entry_point.rendered_content
+                            except Exception as e:
+                                logger.error(f"Error extracting grounding info: {str(e)}")
+                            
+                            # Extract sections for highlighting
+                            red_list_section = ""
+                            orange_list_section = ""
+                            green_list_section = ""
+                            recommendations_section = ""
+                            
+                            if "RED LIST:" in response_text:
+                                red_parts = response_text.split("RED LIST:")
+                                if len(red_parts) > 1:
+                                    next_section = next((s for s in ["ORANGE LIST:", "GREEN LIST:", "RECOMMENDATIONS:"] 
+                                                       if s in red_parts[1]), None)
+                                    if next_section:
+                                        red_list_section = red_parts[1].split(next_section)[0].strip()
+                                    else:
+                                        red_list_section = red_parts[1].strip()
+                            
+                            if "ORANGE LIST:" in response_text:
+                                orange_parts = response_text.split("ORANGE LIST:")
+                                if len(orange_parts) > 1:
+                                    next_section = next((s for s in ["GREEN LIST:", "RECOMMENDATIONS:"] 
+                                                       if s in orange_parts[1]), None)
+                                    if next_section:
+                                        orange_list_section = orange_parts[1].split(next_section)[0].strip()
+                                    else:
+                                        orange_list_section = orange_parts[1].strip()
+                            
+                            if "GREEN LIST:" in response_text:
+                                green_parts = response_text.split("GREEN LIST:")
+                                if len(green_parts) > 1:
+                                    if "RECOMMENDATIONS:" in green_parts[1]:
+                                        green_list_section = green_parts[1].split("RECOMMENDATIONS:")[0].strip()
+                                    else:
+                                        green_list_section = green_parts[1].strip()
+                            
+                            if "RECOMMENDATIONS:" in response_text:
+                                recommendations_section = response_text.split("RECOMMENDATIONS:")[1].strip()
+                            
+                            # Display each section with appropriate styling
+                            if red_list_section:
+                                st.error("### ⛔ RED LIST (Non-Waivable Conflicts)")
+                                st.markdown(red_list_section)
+                            
+                            if orange_list_section:
+                                st.warning("### ⚠️ ORANGE LIST (Waivable Conflicts)")
+                                st.markdown(orange_list_section)
+                            
+                            if green_list_section:
+                                st.success("### ✅ GREEN LIST (Minor Issues)")
+                                st.markdown(green_list_section)
+                            
+                            if recommendations_section:
+                                st.info("### 📋 RECOMMENDATIONS")
+                                st.markdown(recommendations_section)
+                            
+                            # If no sections were found, display the full response
+                            if not any([red_list_section, orange_list_section, green_list_section, recommendations_section]):
+                                st.info(response_text)
+                            
+                            # Display grounding information if available
+                            if grounding_info:
+                                with st.expander("Web Search Results Used in Analysis"):
+                                    try:
+                                        # Extract structured data from grounding info if possible
+                                        search_results = []
+                                        
+                                        # Try to extract URLs from grounding metadata
+                                        urls = []
+                                        try:
+                                            if hasattr(rag_response.candidates[0], 'grounding_metadata') and \
+                                               hasattr(rag_response.candidates[0].grounding_metadata, 'web_search'):
+                                                search_queries = rag_response.candidates[0].grounding_metadata.web_search.searches
+                                                for search in search_queries:
+                                                    if hasattr(search, 'results'):
+                                                        for result in search.results:
+                                                            if hasattr(result, 'url') and hasattr(result, 'title') and hasattr(result, 'snippet'):
+                                                                search_results.append({
+                                                                    'title': result.title,
+                                                                    'url': result.url,
+                                                                    'snippet': result.snippet
+                                                                })
+                                        except Exception as e:
+                                            logger.error(f"Error extracting structured search results: {str(e)}")
+                                        
+                                        # If we extracted structured data, display it
+                                        if search_results:
+                                            st.markdown("### 🔍 Search Results Used in Analysis")
+                                            for i, result in enumerate(search_results):
+                                                st.markdown(f"**{i+1}. {result['title']}**")
+                                                st.markdown(f"[{result['url']}]({result['url']})")
+                                                st.markdown(f"> {result['snippet']}")
+                                                st.markdown("---")
+                                        else:
+                                            # Fallback to BeautifulSoup extraction
+                                            import re
+                                            from bs4 import BeautifulSoup
+                                            
+                                            try:
+                                                soup = BeautifulSoup(grounding_info, 'html.parser')
+                                                # Try to extract links from HTML
+                                                links = soup.find_all('a')
+                                                titles = []
+                                                for tag in soup.find_all(['h2', 'h3', 'strong']):
+                                                    if tag.text.strip():
+                                                        titles.append(tag.text.strip())
+                                                
+                                                # Extract snippets - look for paragraphs or div tags
+                                                snippets = []
+                                                for tag in soup.find_all(['p', 'div']):
+                                                    text = tag.text.strip()
+                                                    if len(text) > 50 and text not in snippets:  # Avoid duplicates and headers
+                                                        snippets.append(text)
+                                                
+                                                # Display extracted information
+                                                st.markdown("### 🔍 Information Used in Analysis")
+                                                
+                                                # Display links if found
+                                                if links:
+                                                    st.markdown("#### Source Links:")
+                                                    for i, link in enumerate(links[:15]):  # Limit to 15 links
+                                                        href = link.get('href', '')
+                                                        text = link.text.strip() or href
+                                                        if href and href.startswith('http'):
+                                                            st.markdown(f"{i+1}. [{text}]({href})")
+                                                
+                                                # Display titles if found
+                                                if titles:
+                                                    st.markdown("#### Key Topics:")
+                                                    for i, title in enumerate(titles[:10]):  # Limit to 10 titles
+                                                        st.markdown(f"- {title}")
+                                                
+                                                # Display snippets if found
+                                                if snippets:
+                                                    st.markdown("#### Content Snippets:")
+                                                    for i, snippet in enumerate(snippets):  # Show all snippets
+                                                        st.markdown(f"**Snippet {i+1}:**")
+                                                        st.markdown(f"> {snippet[:300]}..." if len(snippet) > 300 else f"> {snippet}")
+                                                        st.markdown("---")
+                                                
+                                                if not any([links, titles, snippets]):
+                                                    # If nothing could be extracted, fallback to raw text display
+                                                    clean_text = soup.get_text(separator='\n\n')
+                                                    if clean_text:
+                                                        st.markdown("### Search Results Content:")
+                                                        # Display some portions of the text content
+                                                        sections = re.split(r'\n\n+', clean_text)
+                                                        meaningful_sections = [s for s in sections if len(s.strip()) > 15]  # Lower threshold to catch more content
+                                                        for i, section in enumerate(meaningful_sections):  # Show all meaningful sections
+                                                            if section.strip():
+                                                                st.markdown(f"**Extract {i+1}:**")
+                                                                st.markdown(f"> {section.strip()}")
+                                                                st.markdown("---")
+                                                
+                                                # Alternative extraction method as fallback for when structured extraction doesn't work well
+                                                if not snippets or len(snippets) < 3:
+                                                    # Try to extract profile names and other information
+                                                    clean_text = soup.get_text()
+                                                    profile_matches = re.findall(r'([A-Z][a-zA-Z\.\s]+(?:profile|ownership))', clean_text)
+                                                    
+                                                    if profile_matches:
+                                                        st.markdown("#### Profiles & Entities Researched:")
+                                                        # Split list into groups of 5 for better readability
+                                                        profile_groups = [profile_matches[i:i+5] for i in range(0, len(profile_matches), 5)]
+                                                        
+                                                        for group in profile_groups:
+                                                            st.markdown("> " + " | ".join(group))
+                                                        
+                                                        st.markdown("---")
+                                                        st.info("These profiles were researched to identify potential conflicts of interest between arbitrators, parties, and cases.")
+                                            except ImportError:
+                                                # Fallback if BeautifulSoup isn't available
+                                                st.markdown("### Search Results")
+                                                st.info("Search was performed to verify information in the analysis. Install BeautifulSoup to see better formatted results.")
+                                                
+                                                # Try to extract URLs using regex
+                                                urls = re.findall(r'href=[\'"]?([^\'" >]+)', grounding_info)
+                                                if urls:
+                                                    st.markdown("#### Source Links:")
+                                                    for i, url in enumerate(urls[:15]):  # Limit to 15 URLs
+                                                        if url.startswith('http'):
+                                                            st.markdown(f"{i+1}. [{url}]({url})")
+                                        
+                                        # Add reminder about information usage
+                                        st.info("💡 **Note:** The analysis cross-references this information with the arbitration case data to identify potential conflicts of interest.")
+                                        
+                                    except Exception as e:
+                                        # If all else fails, show a simple message
+                                        st.info("Web search was used to ground the analysis with additional information.")
+                                        logger.error(f"Error displaying grounding info: {str(e)}")
+                        elif hasattr(rag_response, 'text'):
+                            # Fallback for old API format
                             response_text = rag_response.text
                             
                             # Extract sections for highlighting
